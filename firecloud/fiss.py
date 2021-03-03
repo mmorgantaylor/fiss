@@ -1528,7 +1528,7 @@ def mop(args):
         unreferenced_files = unreferenced_files - set(sibling_referenced_files)
 
     # Filter out files like .logs and rc.txt
-    def can_delete(f, include, exclude):
+    def can_delete(f):
         '''Return true if this file should not be deleted in a mop.'''
         filename = f.rsplit('/', 1)[-1]
         # Don't delete logs
@@ -1546,21 +1546,20 @@ def mop(args):
         if filename in ('stderr', 'stdout', 'output'):
             return False
         # Only delete specified unreferenced files
-        if include:
-            for glob in include:
-                if fnmatchcase(f, glob):
+        if args.include:
+            for glob in args.include:
+                if fnmatchcase(filename, glob):
                     return True
             return False
         # Don't delete specified unreferenced files
-        if exclude:
-            for glob in exclude:
-                if fnmatchcase(f, glob):
+        if args.exclude:
+            for glob in args.exclude:
+                if fnmatchcase(filename, glob):
                     return False
 
         return True
 
-    # filter out file types we don't want to delete
-    deletable_files = [f for f in unreferenced_files if can_delete(f, args.include, args.exclude)]
+    deletable_files = [f for f in unreferenced_files if can_delete(f)]
 
     if len(deletable_files) == 0:
         if args.verbose:
@@ -2857,10 +2856,10 @@ def main(argv=None):
                       help='Directory to save manifests')
     group = subp.add_mutually_exclusive_group()
     group.add_argument('-i', '--include', nargs='+', metavar="glob",
-                       help="Only delete unreferenced files whose full paths match" +
-                            " the given UNIX glob-style pattern(s)")
+                       help="Only delete unreferenced files matching the " +
+                            "given UNIX glob-style pattern(s)")
     group.add_argument('-x', '--exclude', nargs='+', metavar="glob",
-                       help="Only delete unreferenced files whose full paths don't match" +
+                       help="Only delete unreferenced files that don't match" +
                             " the given UNIX glob-style pattern(s)")
 
     subp.set_defaults(func=mop)
