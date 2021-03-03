@@ -1341,7 +1341,7 @@ def mop(args):
     unreferenced_files = bucket_files - referenced_files
 
     # Filter out files like .logs and rc.txt
-    def can_delete(f):
+    def can_delete(f, include, exclude):
         '''Return true if this file should not be deleted in a mop.'''
         filename = f.rsplit('/', 1)[-1]
         # Don't delete logs
@@ -1361,17 +1361,18 @@ def mop(args):
         # Only delete specified unreferenced files
         if args.include:
             for glob in args.include:
-                if fnmatchcase(filename, glob):
+                if fnmatchcase(f, glob):
                     return True
             return False
         # Don't delete specified unreferenced files
         if args.exclude:
             for glob in args.exclude:
-                if fnmatchcase(filename, glob):
+                if fnmatchcase(f, glob):
                     return False
 
         return True
 
+    # filter out file types we don't want to delete
     deletable_files = [f for f in unreferenced_files if can_delete(f)]
 
     if len(deletable_files) == 0:
@@ -2606,10 +2607,10 @@ def main(argv=None):
                       help='Show deletions that would be performed')
     group = subp.add_mutually_exclusive_group()
     group.add_argument('-i', '--include', nargs='+', metavar="glob",
-                       help="Only delete unreferenced files matching the " +
-                            "given UNIX glob-style pattern(s)")
+                       help="Only delete unreferenced files whose full paths match" +
+                            " the given UNIX glob-style pattern(s)")
     group.add_argument('-x', '--exclude', nargs='+', metavar="glob",
-                       help="Only delete unreferenced files that don't match" +
+                       help="Only delete unreferenced files whose full paths don't match" +
                             " the given UNIX glob-style pattern(s)")
     
     subp.set_defaults(func=mop)
