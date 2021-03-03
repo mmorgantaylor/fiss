@@ -15,7 +15,6 @@ from traceback import print_tb as print_traceback
 from io import open
 from fnmatch import fnmatchcase
 from math import ceil
-from datetime import timedelta
 import argparse
 import subprocess
 import re
@@ -34,9 +33,6 @@ from firecloud import fccore
 from firecloud.errors import *
 from firecloud.__about__ import __version__
 from firecloud import supervisor
-
-# # for memory testing
-# from guppy import hpy
 
 
 # supress that annoying message about using ADC from google
