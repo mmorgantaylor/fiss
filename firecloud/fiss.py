@@ -1262,8 +1262,22 @@ def human_readable_size(size_in_bytes):
     size_str = "{:.2f}".format(size_in_bytes) if reduce_count > 0 else str(size_in_bytes)
     return "{} {}".format(size_str, units[reduce_count])
 
+
 def list_bucket_files(project, bucket_name, referenced_files, verbose):
-    """Lists all the blobs (files) in the bucket, returns md5 and file size info."""
+    """Lists all the blobs (files) in the bucket, returns a dictionary of metadata 
+    including file size, of the format 
+        {full_file_path_1: {"file_name": str,
+                            "file_path": str,
+                            "submission_id": str,
+                            "size": int,
+                            "is_in_data_table": bool },
+         full_file_path_2: {"file_name": str,
+                            "file_path": str,
+                            "submission_id": str,
+                            "size": int,
+                            "is_in_data_table": bool }
+        }
+    """
     if verbose:
         print("listing contents of bucket gs://" + bucket_name)
     
@@ -1288,40 +1302,24 @@ def list_bucket_files(project, bucket_name, referenced_files, verbose):
     def extract_file_metadata(blob):
         blob_name = blob.name
 
-        if not blob_name.endswith('/'):  # if this is not a directory
-            md5 = blob.md5_hash
-            size = blob.size
+        if blob_name.endswith('/'):  # if this is a directory
+            return None
 
-            # note both of these are type datetime.datetime
-            time_created = blob.time_created
-            time_updated = blob.updated
+        full_file_path = "gs://" + bucket_name + "/" + blob_name
+        # Splits the bucket file: "gs://bucket_Id/submission_id/file_path", by the '/' symbol
+        # and stores values in a 5 length array: ['gs:', '' , 'bucket_Id', submission_id, file_path] 
+        # to extract the submission id from the 4th element (index 3) of the array
+        submission_id = full_file_path.split('/', 4)[3]
 
-            full_file_path = "gs://" + bucket_name + "/" + blob_name
-            # Splits the bucket file: "gs://bucket_Id/submission_id/file_path", by the '/' symbol
-            # and stores values in a 5 length array: ['gs:', '' , 'bucket_Id', submission_id, file_path] 
-            # to extract the submission id from the 4th element (index 3) of the array
-            submission_id = full_file_path.split('/', 4)[3]
-            file_name = blob_name.split('/')[-1]
+        file_metadata = {
+            "file_name": blob_name.split('/')[-1],
+            "file_path": full_file_path,
+            "submission_id": submission_id,
+            "size": blob.size,
+            "is_in_data_table": full_file_path in referenced_files
+        }
 
-            unique_key = f"{file_name}.{md5}.{size}"
-
-            # add a field indicating whether this file is referenced in the data table
-            is_in_data_table = full_file_path in referenced_files
-
-            file_metadata = {
-                "file_name": file_name,
-                "file_path": full_file_path,
-                "submission_id": submission_id,
-                "size": size,
-                "md5": md5,
-                "time_created": time_created,
-                "time_updated": time_updated,
-                "unique_key": unique_key,
-                "is_in_data_table": is_in_data_table
-            }
-
-            return file_metadata
-        return None
+        return file_metadata
 
     n_blobs = 0
     for page in blobs.pages:  # iterating through pages is way faster than not
@@ -1334,11 +1332,6 @@ def list_bucket_files(project, bucket_name, referenced_files, verbose):
                 full_file_path = file_metadata['file_path']
                 bucket_dict[full_file_path] = file_metadata
 
-    # # memory testing
-    # h = hpy()
-    # print('MEMORY STUFF AFTER LISTING:')
-    # print(h.heap())
-
     if verbose:
         print(f'Found {len(bucket_dict)} files in bucket {bucket_name}')
 
@@ -1349,11 +1342,6 @@ def delete_files(bucket_name, files_to_delete, verbose):
     '''Delete files in a GCP bucket. Input is a list of full file paths to delete.'''
     # extract blob_name (full path minus bucket name)
     blob_names = [full_path.replace("gs://" + bucket_name + "/", "") for full_path in files_to_delete]
-
-    # # memory testing
-    # h = hpy()
-    # print('MEMORY STUFF AFTER CREATING FILES_TO_DELETE BLOB LIST:')
-    # print(h.heap())
 
     # set up storage client
     storage_client = storage.Client()
@@ -1398,21 +1386,6 @@ def delete_files(bucket_name, files_to_delete, verbose):
 
     if verbose:
         print(f"Successfully deleted {len(blobs)} files from bucket.")
-
-def get_duplicate_info(bucket_dict):
-    '''Make a dictionary of unique keys and a list of all file paths that match each key.'''
-    duplicate_files_dict = dict()  # unique key -> list of file_metadata dicts for all files matching that unique key
-
-    for this_file_path, this_file_metadata in bucket_dict.items():
-        this_unique_key = this_file_metadata['unique_key']
-
-        if this_unique_key not in duplicate_files_dict:
-            duplicate_files_dict[this_unique_key] = [this_file_metadata]
-        else:
-            # this is a duplicate of a file we already have stored
-            duplicate_files_dict[this_unique_key].extend([this_file_metadata])
-
-    return duplicate_files_dict
 
 
 def get_parent_directory(filepath):
@@ -1594,7 +1567,6 @@ def mop(args):
         for full_path in all_bucket_files:
             file_metadata = bucket_dict[full_path]
             file_metadata['to_delete'] = True if full_path in deletable_files else False
-            file_metadata['is_duplicated'] = True if len(duplicate_files_dict[file_metadata['unique_key']]) > 1 else False
             file_metadata['size_human_readable'] = human_readable_size(file_metadata['size']) if 'size' in file_metadata else None
 
             bucket_dict[full_path] = file_metadata
@@ -1632,7 +1604,7 @@ def mop(args):
 
 @fiss_cmd
 def mop_list(args):
-    '''Clean up data in workspace from a given list'''
+    '''Clean up data in workspace from a given list of files to delete.'''
     # First retrieve the workspace to get bucket information
     if args.verbose:
         print("Retrieving workspace information...")
