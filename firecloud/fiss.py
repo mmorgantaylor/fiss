@@ -14,21 +14,29 @@ from inspect import getsourcelines
 from traceback import print_tb as print_traceback
 from io import open
 from fnmatch import fnmatchcase
+from math import ceil
+from datetime import timedelta
 import argparse
 import subprocess
 import re
+import requests
 import warnings
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from difflib import unified_diff
 from google.cloud import storage
 from six import iteritems, string_types, itervalues, u, text_type
 from six.moves import input
+from tqdm import tqdm
 from firecloud import api as fapi
 from firecloud import fccore
 from firecloud.errors import *
 from firecloud.__about__ import __version__
 from firecloud import supervisor
+
+# # for memory testing
+# from guppy import hpy
 
 
 # supress that annoying message about using ADC from google
@@ -1272,8 +1280,12 @@ def list_bucket_files(project, bucket_name, referenced_files, verbose):
     # Note: Client.list_bucket_files requires at least package version 1.17.0.
     blobs = storage_client.list_blobs(bucket_name)
 
+    if verbose:
+        print("finished listing bucket contents. processing files now in chunks of 1000.")
+
     bucket_dict = dict()
-    for blob in blobs:
+
+    def extract_file_metadata(blob):
         blob_name = blob.name
 
         if not blob_name.endswith('/'):  # if this is not a directory
@@ -1307,32 +1319,85 @@ def list_bucket_files(project, bucket_name, referenced_files, verbose):
                 "unique_key": unique_key,
                 "is_in_data_table": is_in_data_table
             }
-            bucket_dict[full_file_path] = file_metadata
+
+            return file_metadata
+        return None
+
+    n_blobs = 0
+    for page in blobs.pages:  # iterating through pages is way faster than not
+        if verbose:
+            n_blobs += page.remaining
+            print(f'...processing {n_blobs} blobs', end='\r')
+        for blob in page:
+            file_metadata = extract_file_metadata(blob)
+            if file_metadata:
+                full_file_path = file_metadata['file_path']
+                bucket_dict[full_file_path] = file_metadata
+
+    # # memory testing
+    # h = hpy()
+    # print('MEMORY STUFF AFTER LISTING:')
+    # print(h.heap())
 
     if verbose:
         print(f'Found {len(bucket_dict)} files in bucket {bucket_name}')
 
     return bucket_dict
 
+
 def delete_files(bucket_name, files_to_delete, verbose):
     '''Delete files in a GCP bucket. Input is a list of full file paths to delete.'''
     # extract blob_name (full path minus bucket name)
     blob_names = [full_path.replace("gs://" + bucket_name + "/", "") for full_path in files_to_delete]
 
+    # # memory testing
+    # h = hpy()
+    # print('MEMORY STUFF AFTER CREATING FILES_TO_DELETE BLOB LIST:')
+    # print(h.heap())
+
     # set up storage client
     storage_client = storage.Client()
+
+    adapter = requests.adapters.HTTPAdapter(pool_connections=64, pool_maxsize=64, max_retries=3)
+    storage_client._http.mount("https://", adapter)
+    storage_client._http._auth_request.session.mount("https://", adapter)
 
     bucket = storage_client.bucket(bucket_name)
     if verbose:
         print(f"Preparing to delete {len(blob_names)} files from bucket {bucket_name}")
     blobs = [bucket.blob(blob_name) for blob_name in blob_names]
 
-    if verbose:
-        print(f"Deleting {len(blobs)} files from bucket {bucket_name}")
-    bucket.delete_blobs(blobs)
+    n_blobs_to_delete = len(blobs)
+    chunk_size = 100
+    n_chunks = ceil(n_blobs_to_delete/float(chunk_size))
+
+    if n_chunks > 1:
+        if verbose:
+            print(f"Deleting {n_blobs_to_delete} files from bucket {bucket_name} in {n_chunks} chunks of {chunk_size}")
+        # break up blobs into chunks
+        blobs_to_delete_list = []
+        for i in range(n_chunks):
+            ind_start = i * chunk_size
+            ind_end = min(ind_start + chunk_size, len(blobs))
+            blobs_to_delete = blobs[ind_start:ind_end]
+            blobs_to_delete_list.append(blobs_to_delete)
+        
+        # don't throw an error if blob not found
+        on_error_list = [lambda blob: None] * len(blobs_to_delete_list)
+
+        if verbose:
+            print(f"Prepared {len(blobs_to_delete_list)} chunks, processing deletions in parallel.")
+
+        with ThreadPoolExecutor(max_workers=50) as e:
+            list(tqdm(e.map(bucket.delete_blobs, blobs_to_delete_list, on_error_list), total=n_chunks))
+
+    else:
+        if verbose:
+            print(f"Deleting {n_blobs_to_delete} files from bucket {bucket_name}")
+        bucket.delete_blobs(blobs)
 
     if verbose:
-        print(f"Successfully deleted {len(blobs)} from bucket.")
+        print(f"Successfully deleted {len(blobs)} files from bucket.")
 
 def get_duplicate_info(bucket_dict):
     '''Make a dictionary of unique keys and a list of all file paths that match each key.'''
@@ -1348,6 +1413,11 @@ def get_duplicate_info(bucket_dict):
             duplicate_files_dict[this_unique_key].extend([this_file_metadata])
 
     return duplicate_files_dict
+
+
+def get_parent_directory(filepath):
+    """Given input `gs://some/file/path/to_object.txt` returns parent directory `gs://some/file/path`."""
+    return '/'.join(filepath.split('/')[:-1])
 
 
 @fiss_cmd
@@ -1417,6 +1487,15 @@ def mop(args):
     # Sort user submission ids for future bucket file verification
     submission_ids = set(item['submissionId'] for item in user_submission_request.json())
 
+    # If protect-directories is selected, we will not delete files in any task-level directory containing referenced files.
+    referenced_directories = set()
+    if args.protect_directories:
+        # get all referenced directories
+        referenced_directories = set([get_parent_directory(f) for f in referenced_files])
+        if args.verbose:
+            num = len(referenced_directories)
+            print("Found {} referenced task-level directories in workspace {}".format(num, workspace_name))
+
     # List files present in the bucket
     bucket_dict = list_bucket_files(args.project, bucket, referenced_files, args.verbose)
 
@@ -1424,11 +1503,10 @@ def mop(args):
 
     # Check to see if bucket file path contain the user's submission id
     # to ensure deletion of files in the submission directories only.
-    eligible_bucket_files = set(file_metadata['file_path'] for file_metadata in bucket_dict.values() if file_metadata['submission_id'] in submission_ids)
-
+    submission_bucket_files = set(file_metadata['file_path'] for file_metadata in bucket_dict.values() if file_metadata['submission_id'] in submission_ids)
 
     if args.verbose:
-        num = len(eligible_bucket_files)
+        num = len(submission_bucket_files)
         if args.verbose:
             print("Found {} submission-related files in bucket {}".format(num, bucket))
 
@@ -1436,7 +1514,18 @@ def mop(args):
     duplicate_files_dict = get_duplicate_info(bucket_dict)
 
     # Set difference shows files in bucket that aren't referenced
-    unreferenced_files = eligible_bucket_files - referenced_files
+    unreferenced_files = submission_bucket_files - referenced_files
+
+    # remove any files in task-level directories that contain referenced files
+    if args.protect_directories:
+        # find all other files in the same task-level directories as referenced files
+        sibling_referenced_files = []
+        for f in unreferenced_files:
+            if get_parent_directory(f) in referenced_directories:
+                sibling_referenced_files.append(f)
+        
+        # remove them from the list of unreferenced files (treat them as referenced)
+        unreferenced_files = unreferenced_files - set(sibling_referenced_files)
 
     # Filter out files like .logs and rc.txt
     def can_delete(f, include, exclude):
@@ -1475,21 +1564,31 @@ def mop(args):
 
     if len(deletable_files) == 0:
         if args.verbose:
-            print("No files to mop in " + workspace['workspace']['name'])
+            print("No files to mop in " + workspace_name)
         return 0
 
     deletable_size = human_readable_size(sum(bucket_dict[f]['size']
                                              for f in deletable_files))
 
-    if args.verbose or args.dry_run:
-        print("Found {} files to delete:\n".format(len(deletable_files)) +
-              "\n".join("{}  {}".format(human_readable_size(bucket_dict[f]['size']).rjust(11), f)
-                        for f in deletable_files) +
-              '\nTotal size of deletable files: {}\n'.format(deletable_size))
+    workspace_no_spaces = args.workspace.replace(' ','_')
 
-    message = "WARNING: Delete {} files totaling {} in {} ({})".format(
-        len(deletable_files), deletable_size, bucket_prefix,
-        workspace['workspace']['name'])
+    if args.verbose or args.dry_run:
+        if len(deletable_files) <= 100:
+            print("Found {} files to delete:\n".format(len(deletable_files)) +
+                  "\n".join("{}  {}".format(human_readable_size(bucket_dict[f]['size']).rjust(11), f)
+                            for f in deletable_files) +
+                '\nTotal size of deletable files: {}\n'.format(deletable_size))
+        else:
+            # more than 100 files found to delete - save list to disk instead
+            print("Found {} files to delete.".format(len(deletable_files)) +
+                '\nTotal size of deletable files: {}\n'.format(deletable_size))
+            if not os.path.exists(args.save_dir):
+                os.mkdir(args.save_dir)
+            files_to_delete_list_path = "{}/files_to_delete_{}_{}.txt".format(args.save_dir, args.project, workspace_no_spaces)
+            print("Saving list of files and sizes to disk ({}) for inspection.".format(files_to_delete_list_path))
+            with open(files_to_delete_list_path, "w") as outfile:
+                outfile.write("\n".join(deletable_files))
+            print("List of files to delete saved to: {}".format(files_to_delete_list_path))
 
     if args.make_manifest:
         # add deletability and human size readable fields to master dictionary
@@ -1502,8 +1601,11 @@ def mop(args):
             bucket_dict[full_path] = file_metadata
 
         # save manifest file
+        if not os.path.exists(args.save_dir):
+            os.mkdir(args.save_dir)
+
         today = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-        manifest_save_name = f'mop_manifest_{args.project}_{args.workspace}_{today}.csv'
+        manifest_save_name = f'{args.save_dir}/mop_manifest_{args.project}_{workspace_no_spaces}_{today}.csv'
 
         fields_for_manifest = ['file_path',
                                'file_name',
@@ -1517,25 +1619,51 @@ def mop(args):
         df = pd.DataFrame.from_dict(bucket_dict, orient='index', columns=fields_for_manifest).sort_values(by=['to_delete','file_path'], ascending=[False, False])
         df.to_csv(manifest_save_name, index=False) 
 
+    message = "WARNING: Delete {} files totaling {} in {} ({})".format(
+        len(deletable_files), deletable_size, bucket_prefix,
+        workspace['workspace']['name'])
+
     if args.dry_run or (not args.yes and not _confirm_prompt(message)):
         return 0
 
     # use GCP client library to delete files
-    result = delete_files(bucket, deletable_files, args.verbose)
-    # Pipe the deletable_files into gsutil rm to remove them
-    gsrm_args = ['gsutil', '-m', 'rm', '-I']
-    PIPE = subprocess.PIPE
-    STDOUT=subprocess.STDOUT
-    if args.verbose:
-        print("Deleting files with gsutil...")
-    gsrm_proc = subprocess.Popen(gsrm_args, stdin=PIPE, stdout=PIPE, stderr=STDOUT)
-    # Pipe the deletable_files into gsutil
-    result = gsrm_proc.communicate(input='\n'.join(deletable_files).encode())[0]
-    if args.verbose:
-        if type(result) == bytes:
-            result = result.decode()
-        print(result.rstrip())
+    delete_files(bucket, deletable_files, args.verbose)
+
     return 0
+
+@fiss_cmd
+def mop_list(args):
+    '''Clean up data in workspace from a given list'''
+    # First retrieve the workspace to get bucket information
+    if args.verbose:
+        print("Retrieving workspace information...")
+    fields = "workspace.bucketName,workspace.name,workspace.attributes"
+    r = fapi.get_workspace(args.project, args.workspace, fields=fields)
+    fapi._check_response_code(r, 200)
+    workspace = r.json()
+    bucket = workspace['workspace']['bucketName']
+    bucket_prefix = 'gs://' + bucket
+
+    if args.verbose:
+        print("{} -- {}".format(args.workspace, bucket_prefix))
+
+    with open(args.delete_list, 'r') as infile:
+        deletable_files_input = infile.readlines()
+
+    # ensure that all the files are actually in the workspace bucket
+    deletable_files = [f.rstrip('\n') for f in deletable_files_input if bucket_prefix in f]
+
+    message = "WARNING: Delete {} files in {} ({})".format(
+        len(deletable_files), bucket_prefix, args.workspace)
+
+    if args.dry_run or (not args.yes and not _confirm_prompt(message)):
+        return 0
+
+    # use GCP client library to delete files
+    delete_files(bucket, deletable_files, args.verbose)
+
+    return 0
+
 
 def _call_gsstat(object_list):
     """
@@ -2721,17 +2849,32 @@ def main(argv=None):
         parents=[workspace_parent])
     subp.add_argument('--dry-run', action='store_true',
                       help='Show deletions that would be performed')
+    subp.add_argument('--protect-directories', action='store_true',
+                      help='Save any submission directory containing referenced files')
     subp.add_argument('--make-manifest', action='store_true',
                       help='Generate csv of all bucket files and which will be deleted')
+    subp.add_argument('--save-dir', type=str, default='mop_data',
+                      help='Directory to save manifests')
     group = subp.add_mutually_exclusive_group()
     group.add_argument('-i', '--include', nargs='+', metavar="glob",
-                       help="Only delete unreferenced files matching the " +
-                            "given UNIX glob-style pattern(s)")
+                       help="Only delete unreferenced files whose full paths match" +
+                            " the given UNIX glob-style pattern(s)")
     group.add_argument('-x', '--exclude', nargs='+', metavar="glob",
-                       help="Only delete unreferenced files that don't match" +
+                       help="Only delete unreferenced files whose full paths don't match" +
                             " the given UNIX glob-style pattern(s)")
 
     subp.set_defaults(func=mop)
+
+    # Delete files from a workspace's bucket using a listed input
+    subp = subparsers.add_parser(
+        'mop_list', description='Remove unused files from a workspace\'s bucket',
+        parents=[workspace_parent])
+    subp.add_argument('--dry-run', action='store_true',
+                      help='Show deletions that would be performed')
+    subp.add_argument('--delete-list', type=str, required=True,
+                      help='Newline-delimited text file containing bucket files to be deleted')
+
+    subp.set_defaults(func=mop_list)
     
     # List all invalid file attributes of a workspaces and its entities
     subp = subparsers.add_parser('validate_file_attrs',
